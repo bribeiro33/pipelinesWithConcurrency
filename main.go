@@ -1,9 +1,12 @@
 package main
 
 import (
+	"flag"
 	"fmt"
 	imageprocessing "goroutines_pipeline/image_processing"
 	"image"
+	"os"
+	"path/filepath"
 	"strings"
 )
 
@@ -11,20 +14,30 @@ type Job struct {
 	InputPath string
 	Image     image.Image
 	OutPath   string
+	Err       error
+}
+
+func ensureOutDir(p string) error {
+	return os.MkdirAll(filepath.Dir(p), 0o755)
 }
 
 func loadImage(paths []string) <-chan Job {
 	out := make(chan Job)
 	go func() {
+		defer close(out)
 		// For each input path create a job and add it to
 		// the out channel
 		for _, p := range paths {
 			job := Job{InputPath: p,
 				OutPath: strings.Replace(p, "images/", "images/output/", 1)}
-			job.Image = imageprocessing.ReadImage(p)
+			img, err := imageprocessing.ReadImage(p)
+			if err != nil {
+				job.Err = err
+			} else {
+				job.Image = img
+			}
 			out <- job
 		}
-		close(out)
 	}()
 	return out
 }
@@ -32,13 +45,15 @@ func loadImage(paths []string) <-chan Job {
 func resize(input <-chan Job) <-chan Job {
 	out := make(chan Job)
 	go func() {
+		defer close(out)
 		// For each input job, create a new job after resize and add it to
 		// the out channel
 		for job := range input { // Read from the channel
-			job.Image = imageprocessing.Resize(job.Image)
+			if job.Err == nil {
+				job.Image = imageprocessing.Resize(job.Image)
+			}
 			out <- job
 		}
-		close(out)
 	}()
 	return out
 }
@@ -46,45 +61,69 @@ func resize(input <-chan Job) <-chan Job {
 func convertToGrayscale(input <-chan Job) <-chan Job {
 	out := make(chan Job)
 	go func() {
+		defer close(out)
 		for job := range input { // Read from the channel
-			job.Image = imageprocessing.Grayscale(job.Image)
+			if job.Err == nil {
+				job.Image = imageprocessing.Grayscale(job.Image)
+			}
 			out <- job
 		}
-		close(out)
 	}()
 	return out
 }
 
-func saveImage(input <-chan Job) <-chan bool {
-	out := make(chan bool)
+func saveImage(input <-chan Job) <-chan error {
+	out := make(chan error)
 	go func() {
+		defer close(out)
 		for job := range input { // Read from the channel
-			imageprocessing.WriteImage(job.OutPath, job.Image)
-			out <- true
+			if job.Err != nil {
+				out <- job.Err
+				continue
+			}
+			if err := ensureOutDir(job.OutPath); err != nil {
+				out <- err
+				continue
+			}
+			if err := imageprocessing.WriteImage(job.OutPath, job.Image); err != nil {
+				out <- err
+				continue
+			}
+			out <- nil
 		}
-		close(out)
 	}()
 	return out
 }
 
 func main() {
+	// CLI input --images="img1.jpg, img2.png,"
+	pathsFlag := flag.String("images", "", "Comma-separated list of image paths to process")
+	flag.Parse()
 
-	imagePaths := []string{"images/image1.jpeg",
-		"images/image2.jpeg",
-		"images/image3.jpeg",
-		"images/image4.jpeg",
+	if *pathsFlag == "" {
+		fmt.Fprintln(os.Stderr, "Error: no image paths provided.\nUsage: go run . --images=\"path1.jpg,path2.png\"")
+		os.Exit(1)
 	}
+
+	imagePaths := strings.Split(*pathsFlag, ",")
+	fmt.Println("Processing images:", imagePaths)
 
 	channel1 := loadImage(imagePaths)
 	channel2 := resize(channel1)
 	channel3 := convertToGrayscale(channel2)
-	writeResults := saveImage(channel3)
+	results := saveImage(channel3)
 
-	for success := range writeResults {
-		if success {
-			fmt.Println("Success!")
+	var failed bool
+	for err := range results {
+		if err != nil {
+			failed = true
+			fmt.Println("Failed: ", err)
 		} else {
-			fmt.Println("Failed!")
+			fmt.Println("Success!")
 		}
 	}
+	if failed {
+		os.Exit(1)
+	}
+
 }
